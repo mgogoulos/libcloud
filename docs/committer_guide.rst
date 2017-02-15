@@ -18,7 +18,7 @@ First congratulations and welcome to the team!
 
 If you haven't yet, subscribe to {dev,users,commits}@apache.libcloud.org
 mailing lists. Committs mailing list is especially important because all of
-the JIRA notification, Gihub Pull Request notifications and build notifications
+the JIRA notification, Github Pull Request notifications and build notifications
 are sent there.
 
 2. Subscribe to the private mailing list
@@ -45,8 +45,8 @@ populate `PGP Key ID` field with your PGP key ID.
 Applying a patch
 ----------------
 
-When applying a third-party patch created using ``git format-patch`` command,
-use the following command:
+When applying a third-party patch created using ``git format-patch`` or
+``git diff`` command, use the following command:
 
 .. sourcecode:: bash
 
@@ -55,8 +55,18 @@ use the following command:
 ``--signoff`` argument signs the patch and lets others know that you have
 reviewed and merged a patch.
 
-If you are merging a patch from the Github pull request, don't forget to
-update the commit message during rebase (or use git commit --amend if the
+If you are working with a Github pull request, you can obtain a patch file
+by appending ``.patch`` to the end of the pull request URL. For example:
+
+.. sourcecode:: bash
+
+    wget https://github.com/apache/libcloud/pull/<pr number>.patch
+    git am --signoff < <pr number>.patch
+    # rebase to squash commits / ammend
+    ...
+
+When working with a Github pull request, also don't forget to
+update the commit message during rebase (or use ``git commit --amend`` if the
 rebase was not necessary) to include the "Closes #prnumber" message. This way,
 the corresponding Github pull request will get automatically closed once the
 Github mirror is updated.
@@ -69,7 +79,11 @@ For example::
 
     Closes #prnumber
 
-After the patch has been applied, make sure to update ``CHANGES`` file.
+If the original patch author didn't squash all of the commits into one and you
+think this is needed, you should squash all the commits yourself using
+``git rebase`` after you have merged / applied the patch.
+
+After the patch has been applied, make sure to update ``CHANGES.rst`` file.
 
 Making a release (for release managers)
 ---------------------------------------
@@ -85,6 +99,7 @@ preparing a release.
 * Make sure ``__version__`` string in ``libcloud/__init__.py`` is up to date
 * Remove the ``tox`` directory with ``rm -rf .tox``
 * Remove the _secrets_ file with ``rm libcloud/test/secrets.py``
+* Remove leftover builds from previous releases. ``rm -f dist/apache*``
 
 2. Update JIRA
 ~~~~~~~~~~~~~~
@@ -129,7 +144,7 @@ For example:
 
 .. sourcecode:: bash
 
-    git tag v0.15.0-tentative 105b9610835f99704996d861d613c5a9a8b3f8b1
+    git tag --sign v0.15.0-tentative 105b9610835f99704996d861d613c5a9a8b3f8b1
 
 5. Upload the release artifacts and start a [VOTE] thread
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -139,6 +154,15 @@ space. Then start a [VOTE] thread on the dev@libcloud.apache.org mailing list.
 
 Once the vote has passed tag the release with a new tag, removing the ``-tentative`` postfix.
 Upload the release artifacts to Apache servers and Pypi.
+
+For example:
+
+.. sourcecode:: bash
+
+    git tag --sign v0.15.0 105b9610835f99704996d861d613c5a9a8b3f8b1
+
+Keep in mind that it's important that you sign the commit / tag with your GPG
+key.
 
 6. Uploading release artifacts to Apache servers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -158,21 +182,13 @@ Upload the release artifacts to Apache servers and Pypi.
 7. Publishing package to PyPi
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**For consistency and security reasons packages are always uploaded to PyPi
-manually using the web interface and not using the setup.py upload
-command.**
+We have a script that runs uploads the signed Python source files to PyPi. It uses twine, so ensure
+you have twine available in your path `which twine` before running. Twine can be downloaded from https://pypi.python.org/pypi/twine
 
-* Run ``python setup.py register`` command. This will register a new
-  version on PyPi, but it won't upload the actual release artifacts.
+.. sourcecode:: bash
 
-* Go to the `PyPi release management page`_, find a new release and click on
-  "files" link.
-
-* Once you are there, upload all the release artifacts (.tar.bz2, .tar.gz,
-  .zip, and .whl). For ``File Type`` select ``Source`` (except for ``.whl``
-  file where you should select ``Python Wheel``) and for ``Python Version``
-  select ``Any (ie. pure Python)``. Make sure to also select and upload a PGP
-  signature for each file (``PGP signature (.asc)`` field).
+    cd dist
+    ./deploy.sh
 
 Once all the files have been uploaded, the page should look similar to the
 screenshot below.
@@ -213,7 +229,7 @@ root of the main code repository.
 
 Check out the website using SVN: ``svn co https://svn.apache.org/repos/asf/libcloud/site/trunk``
 
-* Upate the front page (``source/index.html`` file)
+* Update the front page (``source/index.html`` file)
 * Update "Downloads" page (``source/downloads.md`` file)
 * Add a blog entry in the ``_posts`` directory.
 

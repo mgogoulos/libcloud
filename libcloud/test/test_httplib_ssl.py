@@ -16,13 +16,12 @@
 import os
 import sys
 import os.path
-
 from mock import patch
 
 import libcloud.security
 
 from libcloud.utils.py3 import reload
-from libcloud.httplib_ssl import LibcloudHTTPSConnection
+from libcloud.httplib_ssl import LibcloudConnection
 
 from libcloud.test import unittest
 
@@ -34,7 +33,7 @@ class TestHttpLibSSLTests(unittest.TestCase):
     def setUp(self):
         libcloud.security.VERIFY_SSL_CERT = False
         libcloud.security.CA_CERTS_PATH = ORIGINAL_CA_CERS_PATH
-        self.httplib_object = LibcloudHTTPSConnection('foo.bar')
+        self.httplib_object = LibcloudConnection('foo.bar', port=80)
 
     def test_custom_ca_path_using_env_var_doesnt_exist(self):
         os.environ['SSL_CERT_FILE'] = '/foo/doesnt/exist'
@@ -68,20 +67,6 @@ class TestHttpLibSSLTests(unittest.TestCase):
         self.assertEqual(libcloud.security.CA_CERTS_PATH, [file_path])
 
     @patch('warnings.warn')
-    def test_setup_verify(self, _):
-        libcloud.security.CA_CERTS_PATH = []
-
-        # Should throw a runtime error
-        libcloud.security.VERIFY_SSL_CERT = True
-
-        expected_msg = libcloud.security.CA_CERTS_UNAVAILABLE_ERROR_MSG
-        self.assertRaisesRegexp(RuntimeError, expected_msg,
-                                self.httplib_object._setup_verify)
-
-        libcloud.security.VERIFY_SSL_CERT = False
-        self.httplib_object._setup_verify()
-
-    @patch('warnings.warn')
     def test_setup_ca_cert(self, _):
         # verify = False, _setup_ca_cert should be a no-op
         self.httplib_object.verify = False
@@ -97,14 +82,6 @@ class TestHttpLibSSLTests(unittest.TestCase):
         self.httplib_object._setup_ca_cert()
 
         self.assertTrue(self.httplib_object.ca_cert is not None)
-
-        # verify = True, no CA certs are available, exception should be thrown
-        libcloud.security.CA_CERTS_PATH = []
-
-        expected_msg = libcloud.security.CA_CERTS_UNAVAILABLE_ERROR_MSG
-        self.assertRaisesRegexp(RuntimeError, expected_msg,
-                                self.httplib_object._setup_ca_cert)
-
 
 if __name__ == '__main__':
     sys.exit(unittest.main())

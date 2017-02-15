@@ -13,11 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
-import copy
 import base64
 import hmac
-import sys
+import time
 
 from hashlib import sha1
 
@@ -36,9 +34,11 @@ from libcloud.utils.xml import fixxpath, findtext
 from libcloud.utils.files import read_in_chunks
 from libcloud.common.types import InvalidCredsError, LibcloudError
 from libcloud.common.base import ConnectionUserAndKey, RawResponse
-from libcloud.common.aws import AWSBaseResponse, AWSDriver, AWSTokenConnection
+from libcloud.common.aws import AWSBaseResponse, AWSDriver, \
+    AWSTokenConnection, SignedAWSConnection
 
 from libcloud.storage.base import Object, Container, StorageDriver
+from libcloud.storage.types import ContainerError
 from libcloud.storage.types import ContainerIsNotEmptyError
 from libcloud.storage.types import InvalidContainerNameError
 from libcloud.storage.types import ContainerDoesNotExistError
@@ -52,9 +52,15 @@ EXPIRATION_SECONDS = 15 * 60
 S3_US_STANDARD_HOST = 's3.amazonaws.com'
 S3_US_WEST_HOST = 's3-us-west-1.amazonaws.com'
 S3_US_WEST_OREGON_HOST = 's3-us-west-2.amazonaws.com'
+S3_CN_NORTH_HOST = 's3.cn-north-1.amazonaws.com.cn'
 S3_EU_WEST_HOST = 's3-eu-west-1.amazonaws.com'
 S3_AP_SOUTHEAST_HOST = 's3-ap-southeast-1.amazonaws.com'
-S3_AP_NORTHEAST_HOST = 's3-ap-northeast-1.amazonaws.com'
+S3_AP_SOUTHEAST2_HOST = 's3-ap-southeast-2.amazonaws.com'
+S3_AP_NORTHEAST1_HOST = 's3-ap-northeast-1.amazonaws.com'
+S3_AP_NORTHEAST2_HOST = 's3-ap-northeast-2.amazonaws.com'
+S3_AP_NORTHEAST_HOST = S3_AP_NORTHEAST1_HOST
+S3_SA_EAST_HOST = 's3-sa-east-1.amazonaws.com'
+S3_SA_SOUTHEAST2_HOST = 's3-sa-east-2.amazonaws.com'
 
 API_VERSION = '2006-03-01'
 NAMESPACE = 'http://s3.amazonaws.com/doc/%s/' % (API_VERSION)
@@ -100,20 +106,9 @@ class BaseS3Connection(ConnectionUserAndKey):
     responseCls = S3Response
     rawResponseCls = S3RawResponse
 
-    def add_default_params(self, params):
-        expires = str(int(time.time()) + EXPIRATION_SECONDS)
-        params['AWSAccessKeyId'] = self.user_id
-        params['Expires'] = expires
-        return params
-
-    def pre_connect_hook(self, params, headers):
-        params['Signature'] = self._get_aws_auth_param(
-            method=self.method, headers=headers, params=params,
-            expires=params['Expires'], secret_key=self.key, path=self.action)
-        return params, headers
-
-    def _get_aws_auth_param(self, method, headers, params, expires,
-                            secret_key, path='/'):
+    @staticmethod
+    def get_auth_signature(method, headers, params, expires, secret_key, path,
+                           vendor_prefix):
         """
         Signature = URL-Encode( Base64( HMAC-SHA1( YourSecretAccessKeyID,
                                     UTF-8-Encoding-Of( StringToSign ) ) ) );
@@ -122,50 +117,34 @@ class BaseS3Connection(ConnectionUserAndKey):
             Content-MD5 + "\n" +
             Content-Type + "\n" +
             Expires + "\n" +
-            CanonicalizedAmzHeaders +
+            CanonicalizedVendorHeaders +
             CanonicalizedResource;
         """
-        special_header_keys = ['content-md5', 'content-type', 'date']
-        special_header_values = {'date': ''}
-        amz_header_values = {}
+        special_headers = {'content-md5': '', 'content-type': '', 'date': ''}
+        vendor_headers = {}
 
-        headers_copy = copy.deepcopy(headers)
-        for key, value in list(headers_copy.items()):
+        for key, value in list(headers.items()):
             key_lower = key.lower()
-            if key_lower in special_header_keys:
-                special_header_values[key_lower] = value.strip()
-            elif key_lower.startswith('x-amz-'):
-                amz_header_values[key.lower()] = value.strip()
-
-        if 'content-md5' not in special_header_values:
-            special_header_values['content-md5'] = ''
-
-        if 'content-type' not in special_header_values:
-            special_header_values['content-type'] = ''
+            if key_lower in special_headers:
+                special_headers[key_lower] = value.strip()
+            elif key_lower.startswith(vendor_prefix):
+                vendor_headers[key_lower] = value.strip()
 
         if expires:
-            special_header_values['date'] = str(expires)
-
-        keys_sorted = list(special_header_values.keys())
-        keys_sorted.sort()
+            special_headers['date'] = str(expires)
 
         buf = [method]
-        for key in keys_sorted:
-            value = special_header_values[key]
+        for _, value in sorted(special_headers.items()):
             buf.append(value)
         string_to_sign = '\n'.join(buf)
 
-        keys_sorted = list(amz_header_values.keys())
-        keys_sorted.sort()
-
-        amz_header_string = []
-        for key in keys_sorted:
-            value = amz_header_values[key]
-            amz_header_string.append('%s:%s' % (key, value))
-        amz_header_string = '\n'.join(amz_header_string)
+        buf = []
+        for key, value in sorted(vendor_headers.items()):
+            buf.append('%s:%s' % (key, value))
+        header_string = '\n'.join(buf)
 
         values_to_sign = []
-        for value in [string_to_sign, amz_header_string, path]:
+        for value in [string_to_sign, header_string, path]:
             if value:
                 values_to_sign.append(value)
 
@@ -174,6 +153,19 @@ class BaseS3Connection(ConnectionUserAndKey):
             hmac.new(b(secret_key), b(string_to_sign), digestmod=sha1).digest()
         )
         return b64_hmac.decode('utf-8')
+
+    def add_default_params(self, params):
+        expires = str(int(time.time()) + EXPIRATION_SECONDS)
+        params['AWSAccessKeyId'] = self.user_id
+        params['Expires'] = expires
+        return params
+
+    def pre_connect_hook(self, params, headers):
+        params['Signature'] = self.get_auth_signature(
+            method=self.method, headers=headers, params=params,
+            expires=params['Expires'], secret_key=self.key, path=self.action,
+            vendor_prefix=self.driver.http_vendor_prefix)
+        return params, headers
 
 
 class S3Connection(AWSTokenConnection, BaseS3Connection):
@@ -253,7 +245,7 @@ class BaseS3StorageDriver(StorageDriver):
         :rtype: ``list`` of :class:`Object`
         """
         return list(self.iterate_container_objects(container,
-                    ex_prefix=ex_prefix))
+                                                   ex_prefix=ex_prefix))
 
     def iterate_container_objects(self, container, ex_prefix=None):
         """
@@ -378,10 +370,10 @@ class BaseS3StorageDriver(StorageDriver):
                       'be unique among all the containers in the system',
                 container_name=container_name, driver=self)
         elif response.status == httplib.BAD_REQUEST:
-            raise InvalidContainerNameError(value='Container name contains ' +
-                                            'invalid characters.',
-                                            container_name=container_name,
-                                            driver=self)
+            raise ContainerError(
+                value='Bad request when creating container: %s' %
+                      response.body,
+                container_name=container_name, driver=self)
 
         raise LibcloudError('Unexpected status code: %s' % (response.status),
                             driver=self)
@@ -421,13 +413,15 @@ class BaseS3StorageDriver(StorageDriver):
 
     def download_object_as_stream(self, obj, chunk_size=None):
         obj_path = self._get_object_path(obj.container, obj.name)
-        response = self.connection.request(obj_path, method='GET', raw=True)
+        response = self.connection.request(obj_path, method='GET',
+                                           stream=True, raw=True)
 
-        return self._get_object(obj=obj, callback=read_in_chunks,
-                                response=response,
-                                callback_kwargs={'iterator': response.response,
-                                                 'chunk_size': chunk_size},
-                                success_status_code=httplib.OK)
+        return self._get_object(
+            obj=obj, callback=read_in_chunks,
+            response=response,
+            callback_kwargs={'iterator': response.iter_content(CHUNK_SIZE),
+                             'chunk_size': chunk_size},
+            success_status_code=httplib.OK)
 
     def upload_object(self, file_path, container, object_name, extra=None,
                       verify_hash=True, ex_storage_class=None):
@@ -437,182 +431,10 @@ class BaseS3StorageDriver(StorageDriver):
         :param ex_storage_class: Storage class
         :type ex_storage_class: ``str``
         """
-        upload_func = self._upload_file
-        upload_func_kwargs = {'file_path': file_path}
-
         return self._put_object(container=container, object_name=object_name,
-                                upload_func=upload_func,
-                                upload_func_kwargs=upload_func_kwargs,
                                 extra=extra, file_path=file_path,
                                 verify_hash=verify_hash,
                                 storage_class=ex_storage_class)
-
-    def _upload_multipart(self, response, data, iterator, container,
-                          object_name, calculate_hash=True):
-        """
-        Callback invoked for uploading data to S3 using Amazon's
-        multipart upload mechanism
-
-        :param response: Response object from the initial POST request
-        :type response: :class:`S3RawResponse`
-
-        :param data: Any data from the initial POST request
-        :type data: ``str``
-
-        :param iterator: The generator for fetching the upload data
-        :type iterator: ``generator``
-
-        :param container: The container owning the object to which data is
-            being uploaded
-        :type container: :class:`Container`
-
-        :param object_name: The name of the object to which we are uploading
-        :type object_name: ``str``
-
-        :keyword calculate_hash: Indicates if we must calculate the data hash
-        :type calculate_hash: ``bool``
-
-        :return: A tuple of (status, checksum, bytes transferred)
-        :rtype: ``tuple``
-        """
-
-        object_path = self._get_object_path(container, object_name)
-
-        # Get the upload id from the response xml
-        response.body = response.response.read()
-        body = response.parse_body()
-        upload_id = body.find(fixxpath(xpath='UploadId',
-                                       namespace=self.namespace)).text
-
-        try:
-            # Upload the data through the iterator
-            result = self._upload_from_iterator(iterator, object_path,
-                                                upload_id, calculate_hash)
-            (chunks, data_hash, bytes_transferred) = result
-
-            # Commit the chunk info and complete the upload
-            etag = self._commit_multipart(object_path, upload_id, chunks)
-        except Exception:
-            exc = sys.exc_info()[1]
-            # Amazon provides a mechanism for aborting an upload.
-            self._abort_multipart(object_path, upload_id)
-            raise exc
-
-        # Modify the response header of the first request. This is used
-        # by other functions once the callback is done
-        response.headers['etag'] = etag
-
-        return (True, data_hash, bytes_transferred)
-
-    def _upload_from_iterator(self, iterator, object_path, upload_id,
-                              calculate_hash=True):
-        """
-        Uploads data from an interator in fixed sized chunks to S3
-
-        :param iterator: The generator for fetching the upload data
-        :type iterator: ``generator``
-
-        :param object_path: The path of the object to which we are uploading
-        :type object_name: ``str``
-
-        :param upload_id: The upload id allocated for this multipart upload
-        :type upload_id: ``str``
-
-        :keyword calculate_hash: Indicates if we must calculate the data hash
-        :type calculate_hash: ``bool``
-
-        :return: A tuple of (chunk info, checksum, bytes transferred)
-        :rtype: ``tuple``
-        """
-
-        data_hash = None
-        if calculate_hash:
-            data_hash = self._get_hash_function()
-
-        bytes_transferred = 0
-        count = 1
-        chunks = []
-        params = {'uploadId': upload_id}
-
-        # Read the input data in chunk sizes suitable for AWS
-        for data in read_in_chunks(iterator, chunk_size=CHUNK_SIZE,
-                                   fill_size=True, yield_empty=True):
-            bytes_transferred += len(data)
-
-            if calculate_hash:
-                data_hash.update(data)
-
-            chunk_hash = self._get_hash_function()
-            chunk_hash.update(data)
-            chunk_hash = base64.b64encode(chunk_hash.digest()).decode('utf-8')
-
-            # This provides an extra level of data check and is recommended
-            # by amazon
-            headers = {'Content-MD5': chunk_hash}
-            params['partNumber'] = count
-
-            request_path = '?'.join((object_path, urlencode(params)))
-
-            resp = self.connection.request(request_path, method='PUT',
-                                           data=data, headers=headers)
-
-            if resp.status != httplib.OK:
-                raise LibcloudError('Error uploading chunk', driver=self)
-
-            server_hash = resp.headers['etag']
-
-            # Keep this data for a later commit
-            chunks.append((count, server_hash))
-            count += 1
-
-        if calculate_hash:
-            data_hash = data_hash.hexdigest()
-
-        return (chunks, data_hash, bytes_transferred)
-
-    def _commit_multipart(self, object_path, upload_id, chunks):
-        """
-        Makes a final commit of the data.
-
-        :param object_path: Server side object path.
-        :type object_path: ``str``
-
-        :param upload_id: ID of the multipart upload.
-        :type upload_id: ``str``
-
-        :param upload_id: A list of (chunk_number, chunk_hash) tuples.
-        :type upload_id: ``list``
-        """
-
-        root = Element('CompleteMultipartUpload')
-
-        for (count, etag) in chunks:
-            part = SubElement(root, 'Part')
-            part_no = SubElement(part, 'PartNumber')
-            part_no.text = str(count)
-
-            etag_id = SubElement(part, 'ETag')
-            etag_id.text = str(etag)
-
-        data = tostring(root)
-
-        params = {'uploadId': upload_id}
-        request_path = '?'.join((object_path, urlencode(params)))
-        response = self.connection.request(request_path, data=data,
-                                           method='POST')
-
-        if response.status != httplib.OK:
-            element = response.object
-            # pylint: disable=maybe-no-member
-            code, message = response._parse_error_details(element=element)
-            msg = 'Error in multipart commit: %s (%s)' % (message, code)
-            raise LibcloudError(msg, driver=self)
-
-        # Get the server's etag to be passed back to the caller
-        body = response.parse_body()
-        server_hash = body.find(fixxpath(xpath='ETag',
-                                         namespace=self.namespace)).text
-        return server_hash
 
     def _abort_multipart(self, object_path, upload_id):
         """
@@ -649,29 +471,11 @@ class BaseS3StorageDriver(StorageDriver):
         # Amazon provides a different (complex?) mechanism to do multipart
         # uploads
         if self.supports_s3_multipart_upload:
-            # Initiate the multipart request and get an upload id
-            upload_func = self._upload_multipart
-            upload_func_kwargs = {'iterator': iterator,
-                                  'container': container,
-                                  'object_name': object_name}
-            method = 'POST'
-            iterator = iter('')
-            params = 'uploads'
-
-        elif self.supports_chunked_encoding:
-            upload_func = self._stream_data
-            upload_func_kwargs = {'iterator': iterator}
-        else:
-            # In this case, we have to load the entire object to
-            # memory and send it as normal data
-            upload_func = self._upload_data
-            upload_func_kwargs = {}
-
+            # @TODO: This needs implementing again from scratch.
+            pass
         return self._put_object(container=container, object_name=object_name,
-                                upload_func=upload_func,
-                                upload_func_kwargs=upload_func_kwargs,
                                 extra=extra, method=method, query_args=params,
-                                iterator=iterator, verify_hash=False,
+                                stream=iterator, verify_hash=False,
                                 storage_class=ex_storage_class)
 
     def delete_object(self, obj):
@@ -729,7 +533,7 @@ class BaseS3StorageDriver(StorageDriver):
 
             if response.status != httplib.OK:
                 raise LibcloudError('Error fetching multipart uploads. '
-                                    'Got code: %s' % (response.status),
+                                    'Got code: %s' % response.status,
                                     driver=self)
 
             body = response.parse_body()
@@ -790,10 +594,9 @@ class BaseS3StorageDriver(StorageDriver):
         name = urlquote(name)
         return name
 
-    def _put_object(self, container, object_name, upload_func,
-                    upload_func_kwargs, method='PUT', query_args=None,
-                    extra=None, file_path=None, iterator=None,
-                    verify_hash=True, storage_class=None):
+    def _put_object(self, container, object_name, method='PUT',
+                    query_args=None, extra=None, file_path=None,
+                    stream=None, verify_hash=True, storage_class=None):
         headers = {}
         extra = extra or {}
         storage_class = storage_class or 'standard'
@@ -827,19 +630,19 @@ class BaseS3StorageDriver(StorageDriver):
         # user does not have correct permission
         result_dict = self._upload_object(
             object_name=object_name, content_type=content_type,
-            upload_func=upload_func, upload_func_kwargs=upload_func_kwargs,
             request_path=request_path, request_method=method,
-            headers=headers, file_path=file_path, iterator=iterator)
+            headers=headers, file_path=file_path, stream=stream)
 
         response = result_dict['response']
         bytes_transferred = result_dict['bytes_transferred']
         headers = response.headers
-        response = response.response
-        server_hash = headers['etag'].replace('"', '')
+        response = response
+        server_hash = headers.get('etag', '').replace('"', '')
 
         if (verify_hash and result_dict['data_hash'] != server_hash):
             raise ObjectHashMismatchError(
-                value='MD5 hash checksum does not match',
+                value='MD5 hash {0} checksum does not match {1}'.format(
+                    server_hash, result_dict['data_hash']),
                 object_name=object_name, driver=self)
         elif response.status == httplib.OK:
             obj = Object(
@@ -855,7 +658,7 @@ class BaseS3StorageDriver(StorageDriver):
 
     def _to_containers(self, obj, xpath):
         for element in obj.findall(fixxpath(xpath=xpath,
-                                   namespace=self.namespace)):
+                                            namespace=self.namespace)):
             yield self._to_container(element)
 
     def _to_objs(self, obj, xpath, container):
@@ -951,6 +754,30 @@ class S3USWestOregonStorageDriver(S3StorageDriver):
     ex_location_name = 'us-west-2'
 
 
+class S3CNNorthConnection(SignedAWSConnection, BaseS3Connection):
+    host = S3_CN_NORTH_HOST
+    service_name = 's3'
+    version = API_VERSION
+
+    def __init__(self, user_id, key, secure=True, host=None, port=None,
+                 url=None, timeout=None, proxy_url=None, token=None,
+                 retry_delay=None, backoff=None):
+        super(S3CNNorthConnection, self).__init__(
+            user_id, key, secure, host,
+            port, url, timeout, proxy_url,
+            token, retry_delay, backoff,
+            4)  # force version 4
+
+
+class S3CNNorthStorageDriver(S3StorageDriver):
+    name = 'Amazon S3 (cn-north-1)'
+    connectionCls = S3CNNorthConnection
+    ex_location_name = 'cn-north-1'
+    region_name = 'cn-north-1'
+    # v4 auth and multipart_upload currently do not work.
+    supports_s3_multipart_upload = False
+
+
 class S3EUWestConnection(S3Connection):
     host = S3_EU_WEST_HOST
 
@@ -971,11 +798,58 @@ class S3APSEStorageDriver(S3StorageDriver):
     ex_location_name = 'ap-southeast-1'
 
 
-class S3APNEConnection(S3Connection):
-    host = S3_AP_NORTHEAST_HOST
+class S3APSE2Connection(S3Connection):
+    host = S3_AP_SOUTHEAST2_HOST
 
 
-class S3APNEStorageDriver(S3StorageDriver):
+class S3APSE2StorageDriver(S3StorageDriver):
+    name = 'Amazon S3 (ap-southeast-2)'
+    connectionCls = S3APSE2Connection
+    ex_location_name = 'ap-southeast-2'
+
+
+class S3APNE1Connection(S3Connection):
+    host = S3_AP_NORTHEAST1_HOST
+
+S3APNEConnection = S3APNE1Connection
+
+
+class S3APNE1StorageDriver(S3StorageDriver):
     name = 'Amazon S3 (ap-northeast-1)'
     connectionCls = S3APNEConnection
     ex_location_name = 'ap-northeast-1'
+
+S3APNEStorageDriver = S3APNE1StorageDriver
+
+
+class S3APNE2Connection(SignedAWSConnection, BaseS3Connection):
+    host = S3_AP_NORTHEAST2_HOST
+    service_name = 's3'
+    version = API_VERSION
+
+    def __init__(self, user_id, key, secure=True, host=None, port=None,
+                 url=None, timeout=None, proxy_url=None, token=None,
+                 retry_delay=None, backoff=None):
+        super(S3APNE2Connection, self).__init__(user_id, key, secure, host,
+                                                port, url, timeout, proxy_url,
+                                                token, retry_delay, backoff,
+                                                4)  # force version 4
+
+
+class S3APNE2StorageDriver(S3StorageDriver):
+    name = 'Amazon S3 (ap-northeast-2)'
+    connectionCls = S3APNE2Connection
+    ex_location_name = 'ap-northeast-2'
+    region_name = 'ap-northeast-2'
+    # v4 auth and multipart_upload currently do not work.
+    supports_s3_multipart_upload = False
+
+
+class S3SAEastConnection(S3Connection):
+    host = S3_SA_EAST_HOST
+
+
+class S3SAEastStorageDriver(S3StorageDriver):
+    name = 'Amazon S3 (sa-east-1)'
+    connectionCls = S3SAEastConnection
+    ex_location_name = 'sa-east-1'
